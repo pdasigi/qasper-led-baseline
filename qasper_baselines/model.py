@@ -2,7 +2,6 @@ from typing import Any, Dict, List
 from overrides import overrides
 
 from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
-from transformers.models.led.modeling_led import shift_tokens_right
 import torch
 
 from allennlp.nn import util
