@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 import torch
 from torch.nn import MarginRankingLoss
 
+from allennlp.common.file_utils import cached_path
 from allennlp.nn import util
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.models import Model
@@ -26,7 +27,7 @@ class QasperCalibrator(Model):
         **kwargs
     ):
         super().__init__(vocab, **kwargs)
-        model_archive = load_archive(serialized_model_path)
+        model_archive = load_archive(cached_path(serialized_model_path))
         self._qasper_led = model_archive.model.transformer
         self._tokenizer = model_archive.model.tokenizer
         self._num_samples = num_samples
