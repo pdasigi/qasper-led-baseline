@@ -24,6 +24,8 @@ class QasperCalibrator(Model):
         vocab: Vocabulary,
         serialized_model_path: str,
         num_samples: int = 20,
+        max_length: int = 20,
+        use_mle_loss: bool = False,
         **kwargs
     ):
         super().__init__(vocab, **kwargs)
@@ -31,8 +33,12 @@ class QasperCalibrator(Model):
         self._qasper_led = model_archive.model.transformer
         self._tokenizer = model_archive.model.tokenizer
         self._num_samples = num_samples
+        self._max_length = max_length
+        self._use_mle_loss = use_mle_loss
+
         self._top_answer_f1 = Average()
         self._oracle_answer_f1 = Average()
+        self._ranking_loss = Average()
         self._loss_function = MarginRankingLoss()
 
     def forward(
@@ -47,14 +53,33 @@ class QasperCalibrator(Model):
         input_ids = util.get_token_ids_from_text_field_tensors(question_with_context)
         attention_mask = util.get_text_field_mask(question_with_context)
 
-        generation_output = self._sample_with_grad(
+        if self._use_mle_loss:
+            if answer is not None:
+                answer_ids = util.get_token_ids_from_text_field_tensors(answer)
+            else:
+                answer_ids = None
+
+            forward_pass_output = self._qasper_led(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                global_attention_mask=global_attention_mask,
+                labels=answer_ids,
+                use_cache=False,
+                return_dict=True,
+                output_hidden_states=False,
+            )
+            mle_loss = forward_pass_output["loss"]
+        else:
+            mle_loss = None
+
+        output_samples = self._sample_with_grad(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 global_attention_mask=global_attention_mask
         )
         # TODO (pradeep): Assuming batch size is 1.
         assert len(metadata) == 1
-        predictions, model_scores = self._get_predictions_and_scores(generation_output)
+        predictions, model_scores = self._get_predictions_and_scores(output_samples)
         gold_answers = [a["text"] for a in metadata[0]["all_answers"]]
         f1_scores = [max([squad.compute_f1(sample_prediction, gold_answer) for gold_answer in gold_answers])
                      for sample_prediction in predictions]
@@ -70,8 +95,12 @@ class QasperCalibrator(Model):
         scores_i = torch.stack(input_scores_1)
         scores_j = torch.stack(input_scores_2)
         target = torch.tensor(target_list, device=scores_i.device)
-        loss = self._loss_function(scores_i, scores_j, target)
-
+        ranking_loss = self._loss_function(scores_i, scores_j, target)
+        self._ranking_loss(ranking_loss)
+        if mle_loss is None:
+            loss = ranking_loss
+        else:
+            loss = mle_loss + ranking_loss
         self._oracle_answer_f1(max(f1_scores))
         top_f1_score = sorted(zip([x.tolist() for x in model_scores], f1_scores), key=lambda x: x[0])[-1][1]
         self._top_answer_f1(top_f1_score)
@@ -88,7 +117,6 @@ class QasperCalibrator(Model):
         # attached to the computation graph. So we'll call the relevant code in .generate() here.
         num_beams = self._qasper_led.config.num_beams
         num_beam_groups = self._qasper_led.config.num_beam_groups
-        max_length = self._qasper_led.config.max_length
         pad_token_id = self._qasper_led.config.pad_token_id
         bos_token_id = self._qasper_led.config.bos_token_id
         eos_token_id = self._qasper_led.config.eos_token_id
@@ -105,7 +133,7 @@ class QasperCalibrator(Model):
             bos_token_id=bos_token_id
         )
         # set model_kwargs
-        model_kwargs["use_cache"] = None
+        model_kwargs["use_cache"] = False
         # get distribution pre_processing samplers
         logits_processor = self._qasper_led._get_logits_processor(
             repetition_penalty=None,
@@ -114,7 +142,7 @@ class QasperCalibrator(Model):
             encoder_input_ids=encoder_input_ids,
             bad_words_ids=None,
             min_length=None,
-            max_length=max_length,
+            max_length=self._max_length,
             eos_token_id=None,
             forced_bos_token_id=None,
             forced_eos_token_id=None,
@@ -124,7 +152,7 @@ class QasperCalibrator(Model):
             diversity_penalty=None,
         )
 
-        stopping_criteria = self._qasper_led._get_stopping_criteria(max_length=max_length, max_time=None)
+        stopping_criteria = self._qasper_led._get_stopping_criteria(max_length=self._max_length, max_time=None)
 
         # get probability distribution warper
         logits_warper = self._qasper_led._get_logits_warper(num_beams=num_beams)
@@ -143,7 +171,7 @@ class QasperCalibrator(Model):
             logits_processor=logits_processor,
             logits_warper=logits_warper,
             stopping_criteria=stopping_criteria,
-            max_length=max_length,
+            max_length=self._max_length,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             output_scores=True,
@@ -178,4 +206,5 @@ class QasperCalibrator(Model):
         return {
             "top_f1": self._top_answer_f1.get_metric(reset),
             "oracle_f1": self._oracle_answer_f1.get_metric(reset),
+            "ranking_loss": self._ranking_loss.get_metric(reset),
         }
