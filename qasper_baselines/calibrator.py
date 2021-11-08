@@ -24,8 +24,13 @@ class QasperCalibrator(Model):
         vocab: Vocabulary,
         serialized_model_path: str,
         num_samples: int = 20,
+        validation_num_samples: int = 20,
         max_length: int = 20,
+        validation_max_length: int = 100,
         use_mle_loss: bool = False,
+        mle_loss_weight: float = 1.0,
+        ranking_loss_weight: float = 1.0,
+        greedy_eval: bool = False,
         **kwargs
     ):
         super().__init__(vocab, **kwargs)
@@ -33,11 +38,17 @@ class QasperCalibrator(Model):
         self._qasper_led = model_archive.model.transformer
         self._tokenizer = model_archive.model.tokenizer
         self._num_samples = num_samples
+        self._validation_num_samples = validation_num_samples
         self._max_length = max_length
+        self._validation_max_length = validation_max_length
         self._use_mle_loss = use_mle_loss
+        self._mle_loss_weight = mle_loss_weight
+        self._ranking_loss_weight = ranking_loss_weight
+        self._greedy_eval = greedy_eval
 
         self._top_answer_f1 = Average()
         self._oracle_answer_f1 = Average()
+        self._oracle_rank = Average()
         self._ranking_loss = Average()
         self._loss_function = MarginRankingLoss()
 
@@ -53,65 +64,99 @@ class QasperCalibrator(Model):
         input_ids = util.get_token_ids_from_text_field_tensors(question_with_context)
         attention_mask = util.get_text_field_mask(question_with_context)
 
-        if self._use_mle_loss:
-            if answer is not None:
-                answer_ids = util.get_token_ids_from_text_field_tensors(answer)
-            else:
-                answer_ids = None
-
-            forward_pass_output = self._qasper_led(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                global_attention_mask=global_attention_mask,
-                labels=answer_ids,
-                use_cache=False,
-                return_dict=True,
-                output_hidden_states=False,
-            )
-            mle_loss = forward_pass_output["loss"]
-        else:
-            mle_loss = None
-
-        output_samples = self._sample_with_grad(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                global_attention_mask=global_attention_mask
-        )
+        loss = None
         # TODO (pradeep): Assuming batch size is 1.
         assert len(metadata) == 1
-        predictions, model_scores = self._get_predictions_and_scores(output_samples)
         gold_answers = [a["text"] for a in metadata[0]["all_answers"]]
-        f1_scores = [max([squad.compute_f1(sample_prediction, gold_answer) for gold_answer in gold_answers])
-                     for sample_prediction in predictions]
-        target_list = []
-        input_scores_1 = []
-        input_scores_2 = []
-        for i in range(len(f1_scores) - 1):
-            for j in range(i+1, len(f1_scores)):
-                input_scores_1.append(model_scores[i])
-                input_scores_2.append(model_scores[j])
-                target_list.append(1 if f1_scores[i] >= f1_scores[j] else -1)
-
-        scores_i = torch.stack(input_scores_1)
-        scores_j = torch.stack(input_scores_2)
-        target = torch.tensor(target_list, device=scores_i.device)
-        ranking_loss = self._loss_function(scores_i, scores_j, target)
-        self._ranking_loss(ranking_loss)
-        if mle_loss is None:
-            loss = ranking_loss
+        question_id = metadata[0]["question_id"]
+        output_dict = {"gold_answers": [gold_answers], "question_id": [question_id]}
+        if self._greedy_eval and not self.training:
+            generated_token_ids = self._qasper_led.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    global_attention_mask=global_attention_mask,
+                    max_length=100
+            )
+            predicted_answers = [
+                self._tokenizer.decode(generated_token_ids[i].tolist(), skip_special_tokens=True)
+                for i in range(generated_token_ids.size(0))
+            ]
+            output_dict["predicted_answers"] = predicted_answers
+            f1_score = max([squad.compute_f1(predicted_answers[0], gold_answer) for gold_answer in gold_answers])
+            self._top_answer_f1(f1_score)
         else:
-            loss = mle_loss + ranking_loss
-        self._oracle_answer_f1(max(f1_scores))
-        top_f1_score = sorted(zip([x.tolist() for x in model_scores], f1_scores), key=lambda x: x[0])[-1][1]
-        self._top_answer_f1(top_f1_score)
+            if self._use_mle_loss:
+                if answer is not None:
+                    answer_ids = util.get_token_ids_from_text_field_tensors(answer)
+                else:
+                    answer_ids = None
 
-        return {"loss": loss}
+                forward_pass_output = self._qasper_led(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    global_attention_mask=global_attention_mask,
+                    labels=answer_ids,
+                    use_cache=False,
+                    return_dict=True,
+                    output_hidden_states=False,
+                )
+                mle_loss = forward_pass_output["loss"]
+            else:
+                mle_loss = None
+
+            output_samples = self._sample_with_grad(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    global_attention_mask=global_attention_mask,
+                    max_length=self._max_length if self.training else self._validation_max_length,
+                    num_samples=self._num_samples if self.training else self._validation_num_samples
+            )
+            predictions, model_scores = self._get_predictions_and_scores(output_samples)
+            f1_scores = [max([squad.compute_f1(sample_prediction, gold_answer) for gold_answer in gold_answers])
+                         for sample_prediction in predictions]
+            target_list = []
+            input_scores_1 = []
+            input_scores_2 = []
+            for i in range(len(f1_scores) - 1):
+                for j in range(i+1, len(f1_scores)):
+                    input_scores_1.append(model_scores[i])
+                    input_scores_2.append(model_scores[j])
+                    target_list.append(1 if f1_scores[i] >= f1_scores[j] else -1)
+
+            scores_i = torch.stack(input_scores_1)
+            scores_j = torch.stack(input_scores_2)
+            target = torch.tensor(target_list, device=scores_i.device)
+            ranking_loss = self._loss_function(scores_i, scores_j, target)
+            self._ranking_loss(ranking_loss)
+            if mle_loss is None:
+                loss = ranking_loss
+            else:
+                loss = (self._mle_loss_weight * mle_loss) + (self._ranking_loss_weight * ranking_loss)
+
+            oracle_score = max(f1_scores)
+            self._oracle_answer_f1(oracle_score)
+            sorted_f1_scores = [
+                    y[1] for y in sorted(zip([x.tolist() for x in model_scores], f1_scores), key=lambda x: x[0], reverse=True)
+            ]
+            self._top_answer_f1(sorted_f1_scores[0])
+            oracle_rank = None
+            for i, f1_score in enumerate(sorted_f1_scores):
+                if f1_score == oracle_score:
+                    oracle_rank = i+1
+                    break
+            self._oracle_rank(oracle_rank)
+
+
+        output_dict["loss"] = loss
+        return output_dict
 
     def _sample_with_grad(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        global_attention_mask: torch.Tensor
+        global_attention_mask: torch.Tensor,
+        max_length: int,
+        num_samples: int
     ):
         # .generate() in HuggingFace Transformers has torch.no_grad() set. We want the tensors
         # attached to the computation graph. So we'll call the relevant code in .generate() here.
@@ -142,7 +187,7 @@ class QasperCalibrator(Model):
             encoder_input_ids=encoder_input_ids,
             bad_words_ids=None,
             min_length=None,
-            max_length=self._max_length,
+            max_length=max_length,
             eos_token_id=None,
             forced_bos_token_id=None,
             forced_eos_token_id=None,
@@ -152,7 +197,7 @@ class QasperCalibrator(Model):
             diversity_penalty=None,
         )
 
-        stopping_criteria = self._qasper_led._get_stopping_criteria(max_length=self._max_length, max_time=None)
+        stopping_criteria = self._qasper_led._get_stopping_criteria(max_length=max_length, max_time=None)
 
         # get probability distribution warper
         logits_warper = self._qasper_led._get_logits_warper(num_beams=num_beams)
@@ -160,7 +205,7 @@ class QasperCalibrator(Model):
         # expand input_ids with `num_return_sequences` additional sequences per batch
         input_ids, model_kwargs = self._qasper_led._expand_inputs_for_generation(
             input_ids,
-            expand_size=self._num_samples,
+            expand_size=num_samples,
             is_encoder_decoder=True,
             **model_kwargs,
         )
@@ -171,7 +216,7 @@ class QasperCalibrator(Model):
             logits_processor=logits_processor,
             logits_warper=logits_warper,
             stopping_criteria=stopping_criteria,
-            max_length=self._max_length,
+            max_length=max_length,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             output_scores=True,
@@ -206,5 +251,6 @@ class QasperCalibrator(Model):
         return {
             "top_f1": self._top_answer_f1.get_metric(reset),
             "oracle_f1": self._oracle_answer_f1.get_metric(reset),
+            "oracle_rank": self._oracle_rank.get_metric(reset),
             "ranking_loss": self._ranking_loss.get_metric(reset),
         }
