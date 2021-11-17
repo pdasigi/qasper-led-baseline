@@ -27,9 +27,11 @@ class QasperCalibrator(Model):
         validation_num_samples: int = 20,
         max_length: int = 20,
         validation_max_length: int = 100,
+        normalize_log_probs_by_length: bool = True,
         use_mle_loss: bool = False,
         mle_loss_weight: float = 1.0,
         ranking_loss_weight: float = 1.0,
+        only_top_rank_loss: bool = False,
         greedy_eval: bool = False,
         **kwargs
     ):
@@ -41,9 +43,11 @@ class QasperCalibrator(Model):
         self._validation_num_samples = validation_num_samples
         self._max_length = max_length
         self._validation_max_length = validation_max_length
+        self._normalize_by_length = normalize_log_probs_by_length
         self._use_mle_loss = use_mle_loss
         self._mle_loss_weight = mle_loss_weight
         self._ranking_loss_weight = ranking_loss_weight
+        self._only_top_rank_loss = only_top_rank_loss
         self._greedy_eval = greedy_eval
 
         self._top_answer_f1 = Average()
@@ -114,25 +118,8 @@ class QasperCalibrator(Model):
             predictions, model_scores = self._get_predictions_and_scores(output_samples)
             f1_scores = [max([squad.compute_f1(sample_prediction, gold_answer) for gold_answer in gold_answers])
                          for sample_prediction in predictions]
-            target_list = []
-            input_scores_1 = []
-            input_scores_2 = []
-            for i in range(len(f1_scores) - 1):
-                for j in range(i+1, len(f1_scores)):
-                    input_scores_1.append(model_scores[i])
-                    input_scores_2.append(model_scores[j])
-                    target_list.append(1 if f1_scores[i] >= f1_scores[j] else -1)
-
-            scores_i = torch.stack(input_scores_1)
-            scores_j = torch.stack(input_scores_2)
-            target = torch.tensor(target_list, device=scores_i.device)
-            ranking_loss = self._loss_function(scores_i, scores_j, target)
-            self._ranking_loss(ranking_loss)
-            if mle_loss is None:
-                loss = ranking_loss
-            else:
-                loss = (self._mle_loss_weight * mle_loss) + (self._ranking_loss_weight * ranking_loss)
-
+            
+            # Oracle score and rank computation
             oracle_score = max(f1_scores)
             self._oracle_answer_f1(oracle_score)
             sorted_f1_scores = [
@@ -145,6 +132,36 @@ class QasperCalibrator(Model):
                     oracle_rank = i+1
                     break
             self._oracle_rank(oracle_rank)
+
+            # Ranking loss computation
+            target_list = []
+            input_scores_1 = []
+            input_scores_2 = []
+            if self._only_top_rank_loss:
+                # Only compare the best model score, and the one corresponding to the top f1 score
+                oracle_model_score = model_scores[oracle_rank - 1]
+                best_model_score = max(model_scores)
+                top_f1 = sorted_f1_scores[0]
+                input_scores_1.append(oracle_model_score)
+                input_scores_2.append(best_model_score)
+                target_list.append(1 if oracle_score >= top_f1 else -1)
+            else:
+                for i in range(len(f1_scores) - 1):
+                    for j in range(i+1, len(f1_scores)):
+                        input_scores_1.append(model_scores[i])
+                        input_scores_2.append(model_scores[j])
+                        target_list.append(1 if f1_scores[i] >= f1_scores[j] else -1)
+
+            scores_i = torch.stack(input_scores_1)
+            scores_j = torch.stack(input_scores_2)
+            target = torch.tensor(target_list, device=scores_i.device)
+            ranking_loss = self._loss_function(scores_i, scores_j, target)
+            self._ranking_loss(ranking_loss)
+            if mle_loss is None:
+                loss = ranking_loss
+            else:
+                loss = (self._mle_loss_weight * mle_loss) + (self._ranking_loss_weight * ranking_loss)
+
 
 
         output_dict["loss"] = loss
@@ -228,7 +245,7 @@ class QasperCalibrator(Model):
     def _get_predictions_and_scores(self, generation_output) -> Tuple[List[str], List[float]]:
         predictions = []
         token_log_probs = []
-        normalized_log_probs = []
+        sequence_log_probs = []
         output_sequences = generation_output.sequences.tolist()
         output_scores = generation_output.scores
         for answer_id, sequence in enumerate(output_sequences):
@@ -242,9 +259,12 @@ class QasperCalibrator(Model):
                     break
                 token_log_prob = torch.log(torch.softmax(token_scores[answer_id], 0)[token_id])
                 token_log_probs[-1].append(token_log_prob)
-            normalized_log_probs.append(sum(token_log_probs[-1]) / len(token_log_probs[-1]))
+            if self._normalize_by_length:
+                sequence_log_probs.append(sum(token_log_probs[-1]) / len(token_log_probs[-1]))
+            else:
+                sequence_log_probs.append(sum(token_log_probs[-1]))
 
-        return predictions, normalized_log_probs
+        return predictions, sequence_log_probs
 
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
