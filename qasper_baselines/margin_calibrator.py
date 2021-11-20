@@ -18,7 +18,7 @@ from qasper_baselines import model, dataset_reader
 
 
 @Model.register("qasper_calibrator")
-class QasperCalibrator(Model):
+class QasperMarginCalibrator(Model):
     def __init__(
         self,
         vocab: Vocabulary,
@@ -75,18 +75,23 @@ class QasperCalibrator(Model):
         question_id = metadata[0]["question_id"]
         output_dict = {"gold_answers": [gold_answers], "question_id": [question_id]}
         if self._greedy_eval and not self.training:
-            generated_token_ids = self._qasper_led.generate(
+            generation_output = self._qasper_led.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     global_attention_mask=global_attention_mask,
-                    max_length=100
+                    max_length=100,
+                    output_scores=True,
+                    return_dict_in_generate=True,
             )
-            predicted_answers = [
-                self._tokenizer.decode(generated_token_ids[i].tolist(), skip_special_tokens=True)
-                for i in range(generated_token_ids.size(0))
-            ]
+            predicted_answers, model_scores = self._get_predictions_and_scores(generation_output)
+            #predicted_answers = [
+            #    self._tokenizer.decode(generated_token_ids[i].tolist(), skip_special_tokens=True)
+            #    for i in range(generated_token_ids.size(0))
+            #]
             output_dict["predicted_answers"] = predicted_answers
+            output_dict["model_scores"] = model_scores
             f1_score = max([squad.compute_f1(predicted_answers[0], gold_answer) for gold_answer in gold_answers])
+            output_dict["f1_scores"] = f1_score
             self._top_answer_f1(f1_score)
         else:
             if self._use_mle_loss:
