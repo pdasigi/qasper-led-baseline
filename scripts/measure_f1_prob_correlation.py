@@ -37,25 +37,24 @@ print(f"Spearman correlation between log prob and F1 score: {spearmanr(log_probs
 
 bucket_size = 1 / NUM_BUCKETS
 bucket_limits = [bucket_size]
-bucket_confidences = [bucket_size / 2]
 while bucket_limits[-1] <= 1.0:
     bucket_limits.append(bucket_limits[-1] + bucket_size)
-    bucket_confidences.append((bucket_limits[-2] + bucket_confidences[-1]) / 2)
 
 buckets = {x: [] for x in bucket_limits}
 
 for prob, score in sorted(zip(probs, f1_scores), key=lambda x: x[0]):
     for limit in bucket_limits:
         if limit >= prob:
-            buckets[limit].append(score)
+            buckets[limit].append((prob, score))
             break
 
 errors = []
 num_points = []
-for limit, confidence in zip(bucket_limits, bucket_confidences):
+for limit in bucket_limits:
     num_points.append(len(buckets[limit]))
-    bucket_score = (sum(buckets[limit]) / len(buckets[limit])) if buckets[limit] else 0.0
-    errors.append(abs(bucket_score - confidence))
+    bucket_score = (sum([x[1] for x in buckets[limit]]) / len(buckets[limit])) if buckets[limit] else 0.0
+    bucket_confidence = (sum([x[0] for x in buckets[limit]]) / len(buckets[limit])) if buckets[limit] else 0.0
+    errors.append(abs(bucket_score - bucket_confidence))
 
 ece = sum([x * y for x, y in zip(num_points, errors)]) / sum(num_points)
 print(f"ECE: {ece}")
